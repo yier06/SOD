@@ -1,6 +1,6 @@
 import torch
 from pathlib import Path
-from ...data.dataset import build_dataloaders
+from ...data.dataset_xjy import build_dataloaders
 
 from ...config.dataset.config import Config, set_random_seed
 
