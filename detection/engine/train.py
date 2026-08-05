@@ -1,8 +1,161 @@
 import torch
 from pathlib import Path
-from ...data.dataset import build_dataloaders
-
+from torch.utils.data import DataLoader
+import torch.nn as nn
 from ...config.dataset.config import Config, set_random_seed
+from ...data.dataset import build_dataloaders
+from .checkpoint import save_checkpoint
+
+
+
+
+# ============================================================
+# 6. 单轮训练
+# ============================================================
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    device: torch.device
+):
+    """
+    完成一轮训练。
+    """
+
+    # 切换到训练模式
+    # BatchNorm 和 Dropout 会启用训练行为
+    model.train()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for batch_index, (images, labels) in enumerate(dataloader):
+
+        images = images.to(
+            device,
+            non_blocking=True
+        )
+
+        labels = labels.to(
+            device,
+            non_blocking=True
+        )
+
+        # 清空上一轮反向传播留下的梯度
+        optimizer.zero_grad(set_to_none=True)
+
+        # 只有 CUDA 环境下才开启混合精度
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=device.type == "cuda"
+        ):
+            # 前向传播
+            logits = model(images)
+
+            # 计算损失
+            loss = criterion(logits, labels)
+
+        # 反向传播
+        scaler.scale(loss).backward()
+
+        # 更新模型参数
+        scaler.step(optimizer)
+
+        # 更新缩放因子
+        scaler.update()
+
+        # 统计损失
+        batch_size = images.size(0)
+        total_loss += loss.item() * batch_size
+
+        # logits 中分数最大的位置作为预测类别
+        predictions = torch.argmax(logits, dim=1)
+
+        total_correct += (
+            predictions == labels
+        ).sum().item()
+
+        total_samples += batch_size
+
+        # 每隔一定 batch 打印一次
+        if (batch_index + 1) % 10 == 0:
+            current_loss = total_loss / total_samples
+            current_acc = total_correct / total_samples
+
+            print(
+                f"  Batch [{batch_index + 1:4d}/"
+                f"{len(dataloader):4d}] "
+                f"Loss: {current_loss:.4f} "
+                f"Accuracy: {current_acc:.4f}"
+            )
+
+    epoch_loss = total_loss / total_samples
+    epoch_accuracy = total_correct / total_samples
+
+    return epoch_loss, epoch_accuracy
+
+
+# ============================================================
+# 7. 验证模型
+# ============================================================
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device
+):
+    """
+    在验证集上评估模型。
+
+    @torch.no_grad() 表示不计算梯度，可以降低显存占用。
+    """
+
+    # 切换到评估模式
+    # BatchNorm 和 Dropout 使用推理行为
+    model.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for images, labels in dataloader:
+
+        images = images.to(
+            device,
+            non_blocking=True
+        )
+
+        labels = labels.to(
+            device,
+            non_blocking=True
+        )
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+
+        batch_size = images.size(0)
+
+        total_loss += loss.item() * batch_size
+
+        predictions = torch.argmax(logits, dim=1)
+
+        total_correct += (
+            predictions == labels
+        ).sum().item()
+
+        total_samples += batch_size
+
+    val_loss = total_loss / total_samples
+    val_accuracy = total_correct / total_samples
+
+    return val_loss, val_accuracy
 
 
 
