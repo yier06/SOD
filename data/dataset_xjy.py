@@ -1,141 +1,110 @@
-import torch
+"""COCO detection dataset and dataloader helpers.
+
+The SODA-D annotations use COCO ``bbox=[x, y, width, height]`` format.
+The model consumes absolute ``xyxy`` boxes.
+"""
+
+import json
 from pathlib import Path
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-from ..config.dataset.config import Config, set_random_seed
+from typing import Callable, Dict, List, Tuple
 
-class DetectionDataset(torch.utils.data.Dataset):
-    def __init__(self, image_paths, annotations, transforms=None):
-        self.image_paths = image_paths
-        self.annotations = annotations
-        self.transforms = transforms
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import functional as TF
 
-    def __len__(self):
-        return len(self.image_paths)
 
-    def __getitem__(self, index):
-        image = self.load_image(index)
-        boxes, labels = self.load_annotation(index)
+class COCODetectionDataset(Dataset):
+    def __init__(self, image_dir: Path, annotation_file: Path, image_size: int,
+                 train: bool = False):
+        self.image_dir = Path(image_dir)
+        self.annotation_file = Path(annotation_file)
+        self.image_size = image_size
+        self.train = train
 
-        sample = {
-            "image": image,
-            "boxes": boxes,
-            "labels": labels,
-        }
+        if not self.image_dir.is_dir():
+            raise FileNotFoundError(f"图片目录不存在: {self.image_dir}")
+        if not self.annotation_file.is_file():
+            raise FileNotFoundError(f"标注文件不存在: {self.annotation_file}")
 
-        if self.transforms is not None:
-            sample = self.transforms(sample)
-
-        return sample
-
-# ============================================================
-# 3. 构建数据集和 DataLoader
-# ============================================================
-
-def build_dataloaders(config: Config):
-    """
-    构建训练集、验证集和对应的 DataLoader。
-    """
-
-    train_dir = Path(config.train_dir)
-    val_dir = Path(config.val_dir)
-
-    if not train_dir.exists():
-        raise FileNotFoundError(f"训练集目录不存在：{train_dir}")
-
-    if not val_dir.exists():
-        raise FileNotFoundError(f"验证集目录不存在：{val_dir}")
-
-    # 训练集数据增强
-    train_transform = transforms.Compose([
-        # 随机裁剪，同时缩放到固定大小
-        transforms.RandomResizedCrop(
-            size=config.image_size,
-            scale=(0.8, 1.0)
-        ),
-
-        # 随机水平翻转
-        transforms.RandomHorizontalFlip(p=0.5),
-
-        # 随机调整亮度、对比度和饱和度
-        transforms.ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.2
-        ),
-
-        # PIL Image 转为 Tensor
-        # 像素范围从 [0, 255] 转为 [0, 1]
-        transforms.ToTensor(),
-
-        # 图像归一化
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
+        data = json.loads(self.annotation_file.read_text(encoding="utf-8"))
+        # SODA-D 的 ``ignore`` 是忽略区域，不应作为可学习类别。
+        categories = sorted(
+            [item for item in data["categories"] if item["name"].lower() != "ignore"],
+            key=lambda item: item["id"],
         )
-    ])
+        self.classes = [item["name"] for item in categories]
+        self.class_to_idx = {item["name"]: i for i, item in enumerate(categories)}
+        self.category_to_idx = {item["id"]: i for i, item in enumerate(categories)}
 
-    # 验证集不能使用随机增强
-    val_transform = transforms.Compose([
-        transforms.Resize((config.image_size, config.image_size)),
+        annotations: Dict[int, List[dict]] = {}
+        for ann in data.get("annotations", []):
+            if ann.get("ignore", 0):
+                continue
+            annotations.setdefault(ann["image_id"], []).append(ann)
 
-        transforms.ToTensor(),
+        self.items = []
+        missing = 0
+        for image in data["images"]:
+            path = self.image_dir / image["file_name"]
+            if not path.is_file():
+                missing += 1
+                continue
+            self.items.append((image, annotations.get(image["id"], [])))
+        if missing:
+            print(f"警告: {self.annotation_file.name} 有 {missing} 张图片未找到，已跳过")
 
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
+    def __len__(self) -> int:
+        return len(self.items)
 
-    # ImageFolder 会自动根据子文件夹名称生成类别
-    train_dataset = datasets.ImageFolder(
-        root=train_dir,
-        transform=train_transform
-    )
+    def __getitem__(self, index: int):
+        image_info, anns = self.items[index]
+        image = Image.open(self.image_dir / image_info["file_name"]).convert("RGB")
+        old_w, old_h = image.size
 
-    val_dataset = datasets.ImageFolder(
-        root=val_dir,
-        transform=val_transform
-    )
+        boxes, labels = [], []
+        for ann in anns:
+            x, y, w, h = ann["bbox"]
+            x1, y1 = max(0.0, x), max(0.0, y)
+            x2, y2 = min(float(old_w), x + max(0.0, w)), min(float(old_h), y + max(0.0, h))
+            if x2 > x1 and y2 > y1 and ann["category_id"] in self.category_to_idx:
+                boxes.append([x1, y1, x2, y2])
+                labels.append(self.category_to_idx[ann["category_id"]])
 
-    # 检查训练集和验证集的类别是否一致
-    if train_dataset.class_to_idx != val_dataset.class_to_idx:
-        raise ValueError(
-            "训练集和验证集类别不一致。\n"
-            f"训练集类别：{train_dataset.class_to_idx}\n"
-            f"验证集类别：{val_dataset.class_to_idx}"
-        )
+        image = TF.resize(image, [self.image_size, self.image_size], antialias=True)
+        sx, sy = self.image_size / old_w, self.image_size / old_h
+        boxes = torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        if boxes.numel():
+            boxes[:, [0, 2]] *= sx
+            boxes[:, [1, 3]] *= sy
+        labels = torch.tensor(labels, dtype=torch.long)
 
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False
-    )
+        if self.train and torch.rand(()) < 0.5:
+            image = TF.hflip(image)
+            if boxes.numel():
+                old_x1 = boxes[:, 0].clone()
+                boxes[:, 0] = self.image_size - boxes[:, 2]
+                boxes[:, 2] = self.image_size - old_x1
 
-    val_loader = DataLoader(
-        dataset=val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False
-    )
+        image = TF.normalize(TF.to_tensor(image), [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        return image, {"boxes": boxes, "labels": labels, "image_id": image_info["id"]}
 
-    print("=" * 60)
-    print("数据集加载完成")
-    print(f"训练集图片数量：{len(train_dataset)}")
-    print(f"验证集图片数量：{len(val_dataset)}")
-    print(f"类别数量：{len(train_dataset.classes)}")
-    print(f"类别名称：{train_dataset.classes}")
-    print(f"类别映射：{train_dataset.class_to_idx}")
-    print("=" * 60)
 
-    return (
-        train_loader,
-        val_loader,
-        train_dataset.classes,
-        train_dataset.class_to_idx
-    )
+def detection_collate(batch):
+    images, targets = zip(*batch)
+    return torch.stack(images, 0), list(targets)
+
+
+def build_dataloaders(config):
+    train_set = COCODetectionDataset(config.image_dir, config.split_annotation("train"), config.image_size, True)
+    val_set = COCODetectionDataset(config.image_dir, config.split_annotation("val"), config.image_size, False)
+    if train_set.classes != val_set.classes:
+        raise ValueError("训练集和验证集类别定义不一致")
+
+    common = dict(batch_size=config.batch_size, num_workers=config.num_workers,
+                  pin_memory=torch.cuda.is_available(), collate_fn=detection_collate,
+                  persistent_workers=config.num_workers > 0)
+    train_loader = DataLoader(train_set, shuffle=True, **common)
+    val_loader = DataLoader(val_set, shuffle=False, **common)
+    print(f"训练集: {len(train_set)} 张 | 验证集: {len(val_set)} 张 | 类别: {train_set.classes}")
+    return train_loader, val_loader, train_set.classes, train_set.class_to_idx

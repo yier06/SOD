@@ -6,11 +6,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from ...config.dataset.config import Config, set_random_seed
-from ...data.dataset_xjy import build_dataloaders
-from ..model.model import CustomYOLO11
-from ..loss import YOLO11DetectionLoss
-from .checkpoint import save_checkpoint
+from config.dataset.config import Config, set_random_seed
+from data.dataset_xjy import build_dataloaders
+from detection.model.model import CustomYOLO11
+from detection.loss import YOLO11DetectionLoss
+from detection.engine.checkpoint import save_checkpoint
 
 
 # ============================================================
@@ -492,6 +492,7 @@ def train(config: Config):
     # 保存路径
     # --------------------------------------------------------
 
+    config.validate()
     save_dir = Path(config.save_dir)
     save_dir.mkdir(
         parents=True,
@@ -529,7 +530,7 @@ def train(config: Config):
 
     model = CustomYOLO11(
         num_classes=num_classes,
-        scale="n",
+        scale=config.model_scale,
         reg_max=16,
     ).to(device)
 
@@ -586,9 +587,8 @@ def train(config: Config):
     # 混合精度
     # --------------------------------------------------------
 
-    scaler = torch.amp.GradScaler(
-        "cuda",
-        enabled=device.type == "cuda",
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=device.type == "cuda" and config.amp,
     )
 
     # 验证损失越小越好
@@ -689,6 +689,16 @@ def train(config: Config):
                 "当前最优验证损失："
                 f"{best_val_loss:.4f}"
             )
+
+        save_checkpoint(
+            save_path=save_dir / config.last_model_name,
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch + 1,
+            best_accuracy=best_val_loss,
+            class_names=class_names,
+            class_to_idx=class_to_idx,
+        )
 
     # --------------------------------------------------------
     # 训练结束

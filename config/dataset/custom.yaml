@@ -1,0 +1,13 @@
+# 可复制本文件中的参数到 config/dataset/config.py 的 Config 中调整。
+dataset_root: /home/SODA-D
+image_dir: /home/SODA-D/Images/Images
+annotation_dir: /home/SODA-D/Annotations/Annotations
+save_dir: runs/soda_yolo11
+image_size: 640
+batch_size: 8
+num_epochs: 100
+learning_rate: 0.001
+weight_decay: 0.0005
+num_workers: 4
+model_scale: n
+seed: 42
